@@ -3,6 +3,7 @@
 #include <mutex>
 #include <queue>
 #include <functional>
+#include <future>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -48,7 +49,7 @@ class ThreadPool{
 
 public:
     ThreadPool(const int n_threads = 4)
-        : workers(std::vector<std::thread>(n_threads)), isShutdown(false)
+            : workers(std::vector<std::thread>(n_threads)), isShutdown(false)
     {
     }
     ThreadPool(const ThreadPool &) = delete;
@@ -56,20 +57,18 @@ public:
     ThreadPool &operator=(const ThreadPool &) = delete;
     ThreadPool &operator=(ThreadPool &&) = delete;
 
-    
+
     // Submit a function to be executed asynchronously by the pool
     template <typename F, typename... Args>
     void submit(F &&f, Args &&...args)
     {
         // Create a function with bounded parameter ready to execute
-         // 连接函数和参数定义，特殊函数类型，避免左右值错误
+        // 连接函数和参数定义，特殊函数类型，避免左右值错误
         std::function<decltype(f(args...))()> func = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
-        // Encapsulate it into a shared pointer in order to be able to copy construct
-        auto task_ptr = std::make_shared<decltype(func)>(func);
         // Warp packaged task into void function
-        std::function<void()> warpper_func = [task_ptr]()
+        std::function<void()> warpper_func = [func]()
         {
-            (*task_ptr)();
+            func();
         };
         taskQueue.enqueue(warpper_func);
         conditional.notify_one();
@@ -78,29 +77,29 @@ public:
     void init()
     {
         auto executor = [this](){
-                std::function<void()> func; 
-                bool dequeued; 
-                // 当线程池结束了就应该停止运行，但是依然需要把任务队列里剩余的工作做完
-                while ((!isShutdown) || (!taskQueue.empty()))
+            std::function<void()> func;
+            bool dequeued;
+            // 当线程池结束了就应该停止运行，但是依然需要把任务队列里剩余的工作做完
+            while ((!isShutdown) || (!taskQueue.empty()))
+            {
                 {
+                    std::unique_lock<std::mutex> lock(m_conditional_mutex);
+                    // 当线程池没有结束，并且任务队列为空的话，进入阻塞等待状态
+                    while ((taskQueue.empty()) && (!isShutdown))
                     {
-                        std::unique_lock<std::mutex> lock(m_conditional_mutex);
-                        // 当线程池没有结束，并且任务队列为空的话，进入阻塞等待状态
-                        while ((taskQueue.empty()) && (!isShutdown))
-                        {
-                            conditional.wait(lock);
-                        }
-                        dequeued = taskQueue.dequeue(func);
+                        conditional.wait(lock);
                     }
-                    if (dequeued) {
-                        func();
-                    }
+                    dequeued = taskQueue.dequeue(func);
                 }
-            };
+                if (dequeued) {
+                    func();
+                }
+            }
+        };
 
-        for (int i = 0; i < workers.size(); ++i)
+        for (auto & worker : workers)
         {
-            workers.at(i) = std::thread(executor);
+            worker = std::thread(executor);
         }
     }
     void shutdown()
